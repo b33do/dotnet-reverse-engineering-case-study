@@ -1,186 +1,160 @@
-# Case Study: .NET Intermediate Language (IL) Analysis, Client Telemetry, and Server-Authoritative Boundaries
+# Technical Case Study: .NET Reverse Engineering and Server-Authoritative Security
 
-A deep-dive technical post-mortem and case study investigating the evolution of client-side validation, compiler-generated asynchronous state machines, and the enforcement of the client-server trust boundary in desktop applications.
+A technical post-mortem examining a 64-bit .NET WPF game launcher across three architectural milestones: client-side access checks, telemetry-bound enforcement, and a server-authoritative authentication boundary.
 
----
+This public write-up documents the analysis, toolchain, engineering findings, and results. It does not publish a replayable ban-evasion recipe, extracted cryptographic secrets, or exact local cleanup instructions.
 
-## 📌 Executive Summary
+## Executive Summary
 
-This project documents an in-depth security and systems research investigation of a production .NET 64-bit WPF game launcher application. Over several architectural iterations (**v1.0**, **v2.1**, and **v5.0**), the application evolved its telemetry collection, local storage mechanisms, and server-side validation models. 
+This research investigated a .NET Framework desktop application whose architecture changed substantially across versions 1.0, 2.1, and 5.0. The work combined native disassembly, .NET IL inspection, runtime observation, Windows forensics, and independent cryptographic validation.
 
-This repository analyzes:
-1. How compiler-generated C# `async`/`await` state machines operate at the Microsoft Intermediate Language (MSIL) opcode level.
-2. How desktop applications collect hardware telemetry via Windows Management Instrumentation (WMI) and native network interfaces.
-3. Multi-tier persistence mechanisms across SQLite, the Windows Registry, and WPF `IsolatedStorage`.
-4. **The Zero-Trust Architectural Boundary**: Why even complete client-side telemetry control cannot overcome server-authoritative cryptographic validation.
+The investigation covered:
 
----
+1. Obfuscated control flow, indirect calls, and encrypted strings.
+2. WMI and SMBIOS-based hardware telemetry, network-interface identifiers, and the client-side data flow that produced a hardware manifest.
+3. Cryptographic processing used to protect telemetry in transit.
+4. Login, registration, and periodic enforcement implemented through compiler-generated asynchronous state machines.
+5. Application persistence and local enforcement behavior.
+6. The transition from client-reported trust to server-controlled account validation and signed session issuance.
 
-## 🏗️ Architecture & Evolution Timeline
+## Tooling and Research Environment
 
-```
-+---------------------------------------------------------------------------------------------------+
-|                                       EVOLUTION TIMELINE                                          |
-+---------------------------------------------------------------------------------------------------+
-|                                                                                                   |
-|  [v1.0: Naive Client Architecture]                                                                |
-|  Client evaluates strings locally (e.g. `if (status == "BANNED")`)                                |
-|  -> Weakness: Trivial conditional branch patching (brtrue -> brfalse).                            |
-|                                                                                                   |
-|  [v2.1: Telemetry-Bound Architecture]                                                             |
-|  Server records client-reported WMI / MAC telemetry into an account database.                    |
-|  -> Weakness: Client reports arbitrary telemetry; spoofing WMI queries succeeds.                  |
-|                                                                                                   |
-|  [v5.0: Distributed State Machines & Server-Authoritative Security]                               |
-|  - Logic compiled into complex async state machines (<VHOD>d__358, <REG>d__357).                  |
-|  - Cryptographic session issuance required to authenticate game client.                          |
-|  - Multi-tier server validation: IP/ASN reputation, rate limits, and server-side token generation.  |
-|  -> Outcome: Client telemetry neutralized, but remote server authority prevents token issuance.   |
-|                                                                                                   |
-+---------------------------------------------------------------------------------------------------+
-```
-
----
-
-## 🔍 Phase 1: v1.0 — Baseline Client Evaluation
-
-In early versions of the launcher, authentication and access control were evaluated via straightforward procedural logic.
-
-- **Inspection**: Decompilation revealed synchronous HTTP/Socket calls that returned plain-text status codes from the server.
-- **Client Mechanism**: The launcher executed checks such as:
-  ```csharp
-  // Conceptual representation of v1.0 logic
-  string response = ServerApi.CheckAccount(username);
-  if (response == "BANNED" || response == "SVRBANT") {
-      MessageBox.Show("Your account is suspended.");
-      Application.Current.Shutdown();
-  }
-  ```
-- **Architectural Flaw**: Client-side conditional logic can be bypassed by inverting a single IL branch instruction (`brtrue` $\to$ `brfalse`, or replacing with `nop` / `br.s`). The client mistakenly believed it was the authority on whether to display the game interface.
-
----
-
-## 🛠️ Phase 2: v2.1 — Hardware Telemetry & Identity Fingerprinting
-
-To prevent simple account evasion, the launcher introduced client hardware fingerprinting.
-
-### Telemetry Pipeline
-The client queried several Windows subsystems to create a composite hardware identifier (HWID):
-- **Network Interface**: `NetworkInterface.GetAllNetworkInterfaces()` queried for physical MAC addresses.
-- **WMI Queries**:
-  - `SELECT SerialNumber FROM Win32_BaseBoard`
-  - `SELECT ProcessorId FROM Win32_Processor`
-  - `SELECT UUID FROM Win32_ComputerSystemProduct`
-
-### Analysis & Interception
-In v2.1, the server's backend blindly trusted the client to report its own hardware IDs over the wire:
-1. By disassembling the assembly using `dnlib`, the methods responsible for executing WMI queries were located.
-2. The method bodies were rewritten at the IL level to inject synthetic GUIDs and randomized MAC byte arrays before the payload was serialized.
-3. Because the server only matched the incoming string against its existing blacklist database, spoofed client telemetry successfully satisfied the check.
-
----
-
-## ⚡ Phase 3: v5.0 — Asynchronous State Machines & Server Authority
-
-The target application was updated to a modernized .NET Framework WPF architecture with asynchronous task handling, multi-factor registration, and enhanced backend filtering.
-
-### 1. Dissecting the Roslyn Async State Machines
-Modern C# compilers do not emit standard procedural loops for `async`/`await` methods; they generate internal structs implementing `IAsyncStateMachine`.
-
-Two critical state machines were mapped:
-- **`<VHOD>d__358`** (Login Flow): Handled socket handshakes, account authentication, credential verification, and session token receipt.
-- **`<REG>d__357`** (Registration Flow): Managed multi-step account registration:
-  1. *Step 1*: Submission of email, username, and password.
-  2. *Step 2*: Remote dispatch of email verification PIN.
-  3. *Step 3*: Final PIN submission and cryptographic session handshake.
-
-```
-       [Registration State Machine: <REG>d__357]
-                          |
-                          v
-         +----------------------------------+
-         | State 0: Send Initial Form       |
-         +----------------------------------+
-                          |
-        [Server accepts HWID / Sends PIN]
-                          |
-                          v
-         +----------------------------------+
-         | State 1: Await Email PIN Input   |
-         +----------------------------------+
-                          |
-             [User Submits PIN Code]
-                          |
-                          v
-         +----------------------------------+
-         | State 2: Final Verification      |
-         +----------------------------------+
-             /                          \
-   [Valid Session]               [Server Error: IPRESET]
-          |                                 |
-          v                                 v
-   (Spawn Game Client)         (Unhandled Async Freeze)
-```
-
-### 2. Binary Bytecode Transformation (P1 - P10)
-To audit the local client controls, a custom patching engine (`DayZavrPatcher`) was engineered using `dnlib` to execute 12 bytecode modifications:
-- **P1 - P4 (Telemetry Spoofing)**: Intercepted WMI routines and hardware query handlers, replacing hardware strings with randomized identifiers.
-- **P5 - P8 (Ban Check Neutralization)**: Located conditional branch opcodes evaluating `SVRBANT`, `SVRBANP`, and `BANNED`, converting them to unconditional branch instructions (`br.s`).
-- **P9 - P10 (UI Exception Delegate Suppression)**: Patched the error delegate `b__13` to prevent UI crash dialogs when receiving unknown server error packets.
-
----
-
-## 🔬 Local State Forensics & Forensic Scrubbing
-
-A major challenge during analysis was that the application remembered user state (selected server, language, previous account traces) even after reinstalling the binary. Forensic investigation revealed a multi-tiered persistence footprint across Windows:
-
-| Persistence Layer | Location / Schema | Purpose |
+| Category | Tool or environment | Use in the analysis |
 | :--- | :--- | :--- |
-| **Local Databases** | `%LOCALAPPDATA%\DayZavr\*.db` (`launcher.db`, `Register.db`, `Firefox.db`) | SQLite databases storing cached authentication tokens, news feeds, and registration hashes. |
-| **WPF IsolatedStorage** | `%LOCALAPPDATA%\IsolatedStorage\<hash>\<hash>\Files\*.settings` | Encrypted/hashed framework-managed storage persisting UI locale and server preferences across restarts. |
-| **Windows Registry** | `HKCU\Software\DayZavr`, `HKLM\Software\DayZavr` | Registry keys persisting install directories, launch flags, and unique installation GUIDs. |
-| **Temporary Dumps** | `C:\Temp\DayZ*` | Temporary executable unpacks and memory dumps. |
+| Disassembly and decompilation | Hex-Rays IDA Pro 9.3 (x64) | PE segment inspection, cross-references, string analysis, and control-flow reconstruction. |
+| .NET metadata and IL | dnlib 4.5, .NET Framework 4.8 | CIL inspection, method and state-machine analysis, and validation of metadata behavior. |
+| Runtime observation | Process Explorer and Handle (Sysinternals) | Process relationships, open handles, and runtime behavior. |
+| Windows forensics | PowerShell Core, Registry Editor, SQLite tools | Review of registry state, framework storage, databases, and logs. |
+| Cryptographic validation | Python 3.10+ and PyCryptodome | Independent test-vector checks for observed .NET cryptographic behavior. |
+| Supporting analysis | ILSpy / dnSpy | Managed assembly inspection and comparison of decompiled output with IL-level findings. |
 
-A comprehensive PowerShell forensics script was authored to recursively audit and scrub these artifacts, ensuring testing occurred from a true clean-slate environment.
+## Obfuscation and Architecture
 
----
+The target was a 64-bit WPF application built on .NET Framework 4.8 and protected with PreEmptive Dotfuscator. Analysis encountered control-flow flattening, arithmetic dispatch logic, proxy call redirection, and encrypted string references.
 
-## 🧱 The Architectural Wall: Client Authority vs. Server Authority
+IDA Pro was used to inspect the executable layout, code and string regions, cross-references, and control-flow relationships. Managed metadata and IL inspection helped translate obfuscated routines into architectural roles. Runtime observation was used to check process relationships and behavior against the static model.
 
-Despite completely controlling the client-side environment (neutralized ban dialogs, spoofed hardware telemetry, wiped persistence, and rotated IP addresses), the registration sequence hit an infinite loading state during Step 3 of `<REG>d__357`.
+The reconstructed architecture included:
 
-### Root Cause Analysis:
-1. **The Telemetry Illusion**: The fact that the server sent an email verification PIN proved that client hardware spoofing was successful (the server did not recognize the machine).
-2. **Server-Authoritative Heuristics**: Upon final submission of the PIN, the server evaluated parameters completely outside the client's control:
-   - **Autonomous System Number (ASN) & IP Reputation**: Detection of datacenter, proxy, VPN, or flagged ISP blocks.
-   - **Rate-Limiting & Registration Windows**: Backend database limits preventing rapid account provisioning.
-   - **Cryptographic Token Issuance**: The DayZ game server requires a cryptographically signed ticket from the master server during the connection handshake. Because the server refused to issue this session token, the client had no ticket to pass to the game executable.
+- Firmware and network-interface telemetry collection.
+- A client-side cryptographic pipeline for transforming hardware data.
+- Local access checks and runtime enforcement behavior.
+- Background account verification and server-message handling.
+- Login, registration, and session-establishment flows.
+- State stored across databases, WPF framework storage, registry entries, and logs.
 
-> **Key Takeaway**: A client can modify any instruction running in local memory, but it cannot forge a valid digital signature or force a remote database to issue an authoritative session token.
+Exact binary offsets and a function-by-function patch map are not included in this public summary.
 
----
+## Evolution of the Client and Server Boundary
 
-## 💡 Key Engineering Takeaways for Systems & Security Interviews
+```text
+Version 1.0 — Client-side access checks
+  Synchronous requests returned status values that the launcher interpreted
+  locally. Some access and presentation decisions therefore depended on code
+  executing inside the client process.
 
-### 1. Threat Modeling & Zero-Trust Principles
-- **Principle**: *Never trust the client.* Any security enforcement performed in client code (`if (!isBanned)`) is an illusion.
-- **Defensive Design**: Systems must assume the client binary is running in a compromised environment under an interactive debugger. Sensitive actions must be guarded by short-lived, cryptographically signed tokens (e.g. JWTs / HMAC session tickets) validated by the server on every request.
+Version 2.1 — Telemetry and periodic verification
+  The launcher added hardware-derived identifiers and recurring in-game
+  verification. The client still constructed telemetry that the service used
+  as part of account matching.
 
-### 2. Reversing Compiler-Generated Asynchronous Code
-- C# `async`/`await` methods compile into struct-based state machines. Tracing control flow requires locating the `MoveNext()` method, identifying the `state` field (often `-1` or `0`), and tracking how `TaskAwaiter` callbacks update the execution state.
+Version 5.0 — Server-authoritative sessions
+  Authentication and registration moved to asynchronous flows. The backend
+  performed account and network checks and controlled issuance of the signed
+  session credential required by the game.
+```
 
-### 3. Desktop Application Forensic Footprints
-- Modern desktop frameworks (WPF, WinUI, Electron) store state in non-obvious locations. Fully sanitizing a desktop application requires inspecting SQLite files, Windows Registry hives, Windows Credential Manager, and framework stores like .NET `IsolatedStorage`.
+## Phase 1: Version 1.0 — Telemetry and Cryptographic Data Flow
 
-### 4. Defense in Depth
-- Anti-tampering, obfuscation, and client-side integrity checks are only speed bumps. Robust security relies on server-authoritative state, strict API rate-limiting, network telemetry analysis (ASN/IP reputation), and backend audit logging.
+### Firmware telemetry
 
----
+The launcher queried SMBIOS-related information through Windows Management Instrumentation rather than relying only on a high-level firmware API. The analysis reconstructed how firmware structures contributed fields such as BIOS information, processor characteristics, and memory-device details.
 
-## 📜 Technologies & Concepts Applied
+These fields were normalized into a client-side hardware manifest. The analysis followed the data from collection through formatting and serialization, which made it possible to understand the client’s identity model and its assumptions about telemetry integrity.
 
-- **Languages**: C#, CIL / MSIL (Microsoft Intermediate Language), PowerShell
-- **Tooling & Libraries**: `dnlib`, ILSpy / dnSpy, Process Explorer, Regedit, SQLite3
-- **Frameworks**: .NET Framework, WPF (MahApps.Metro), Asynchronous Programming Model (`IAsyncStateMachine`)
-- **Core Disciplines**: Reverse Engineering, Windows Forensics, Threat Modeling, Distributed Systems Security, Zero-Trust Architecture
+### Network identity and encryption
+
+The application also collected network-interface information and combined it with firmware-derived data. IDA Pro and IL analysis were used to trace the path from collected values to the encrypted telemetry field sent to the service.
+
+The cryptographic review identified an AES-256-CBC processing path and examined the .NET `PasswordDeriveBytes` behavior used by the application. Python and PyCryptodome were used for independent validation of the observed transformation. Fixed passwords, salts, IVs, sample hardware identifiers, and ready-to-use token values are omitted.
+
+### Local enforcement behavior
+
+The launcher contained local routines associated with account enforcement, game-process management, and file-management responses. Static and runtime analysis established how these responsibilities connected to status handling. The public summary describes the behavior without publishing instructions for disabling or repurposing those routines.
+
+## Phase 2: Version 2.1 — Dual-Layer Enforcement
+
+Version 2.1 separated account checks into two broad layers:
+
+1. **Login and fingerprint association.** The launcher sent network and hardware-derived values as part of its authentication flow. The service compared the client report with account state and returned results that the launcher interpreted locally.
+2. **Periodic in-game verification.** A background task checked the active session while the game was running. The client processed the result and could display an enforcement message or affect the game process.
+
+The reverse-engineering work mapped the asynchronous background flow, response parsing, UI handling, and relationship between launcher and game processes. It also showed the architectural weakness in treating client-generated telemetry and client-side checks as authoritative. Local experiments demonstrated that local enforcement behavior was modifiable; that did not change the service’s account records or confer independent authority on the client.
+
+The exact patch sequence, replacement values, and response strings are omitted so the case study does not function as a ready-made bypass guide.
+
+## Phase 3: Version 5.0 — Asynchronous Flows and Server Authority
+
+The later client used compiler-generated state machines for login and multi-stage registration. Tracing `MoveNext()` dispatch and state transitions clarified how the launcher handled credentials, email verification, server responses, and session establishment.
+
+The analysis distinguished client-side events from backend decisions:
+
+- The client could submit a registration request and display the resulting verification flow.
+- Account state and additional risk checks remained under backend control.
+- The game required a cryptographically protected session credential issued by the authentication service.
+- A modified client could change local flow or presentation, but it could not create that server-issued credential or force the backend to accept a transaction.
+
+During the investigation, the final registration flow remained pending after a server-side rejection. Static analysis of the asynchronous error path explained how an unexpected response could leave the UI waiting for a result that was never issued. The specific rejection code and client-side suppression steps are not reproduced.
+
+## Local State and Windows Forensics
+
+The application retained state across reinstalls through multiple Windows storage layers. The forensic review covered:
+
+- SQLite databases used by launcher components.
+- WPF IsolatedStorage and application settings.
+- Windows Registry configuration.
+- Application and game logs, plus third-party client caches.
+
+This work showed why desktop-application investigations must correlate framework-managed storage with conventional configuration and logs. Exact paths, account identifiers, cache-clearing commands, and trace-removal procedures are excluded from the public version.
+
+## Findings and Comparison
+
+| Architectural feature | Version 1.0 | Version 2.1 | Version 5.0 |
+| :--- | :--- | :--- | :--- |
+| Authentication | Synchronous client flow | Socket flow with additional checks | Compiler-generated asynchronous state machines |
+| Hardware data | Firmware-derived telemetry | Firmware and network-interface telemetry | Encrypted telemetry plus server-side request context |
+| Enforcement | Local interpretation of status | Login checks and recurring verification | Backend account validation and session issuance |
+| Trust assumption | Client participates in access decisions | Client reports identity-related data | Backend controls the authoritative session |
+| Key boundary | Client behavior can be modified locally | Client checks remain separate from server state | A valid server-issued credential is required |
+
+The central result was that altering client behavior could change local presentation and telemetry, but the later architecture placed the decisive access boundary on the server. The client could not forge a valid signature or force a remote database to issue an authoritative session.
+
+## Engineering Takeaways
+
+### Treat clients as untrusted
+
+Any desktop client can be inspected and modified in an environment controlled by its user. Client-side checks can improve usability or raise the cost of tampering, but authorization must be enforced by the service that owns the account and session state.
+
+### Combine disassembly with managed-code analysis
+
+IDA Pro’s control-flow and cross-reference views complemented dnlib and decompiler output. For obfuscated .NET applications, combining PE-level disassembly, metadata inspection, IL analysis, and runtime observations produces a stronger model than relying on any one view.
+
+### Understand compiler-generated asynchronous code
+
+Tracing C# `async` and `await` requires following the generated `IAsyncStateMachine`, its `MoveNext()` dispatch, state transitions, and awaiter resumption. This was essential for reconstructing the application’s network and registration behavior.
+
+### Treat telemetry as an untrusted report
+
+Hardware-derived values collected by a client are still client-supplied data. A server should not treat them as proof of identity or integrity without independent validation and carefully designed risk controls.
+
+### Use defense in depth
+
+Obfuscation and client-integrity checks are not security boundaries. Stronger designs use server-authoritative account state, short-lived signed credentials, rate limiting, risk review, and backend audit logs.
+
+## Technologies and Concepts
+
+- **Languages and formats:** C#, CIL / MSIL, PowerShell
+- **Tools:** IDA Pro, dnlib, ILSpy / dnSpy, Process Explorer, Handle, Registry Editor, SQLite tools, Python, PyCryptodome
+- **Frameworks and runtimes:** .NET Framework, WPF, `IAsyncStateMachine`
+- **Disciplines:** Reverse engineering, Windows forensics, application security, distributed systems, threat modeling
 
